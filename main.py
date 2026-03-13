@@ -3,6 +3,8 @@ from discord import app_commands
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+import re
+
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -82,10 +84,9 @@ def parse_existing_message(content):
 def parse_water_count(content):
     for line in content.split("\n"):
         if line.startswith("**Water:**"):
-            try:
-                return int(line.split("**Water:**")[1].split("glasses")[0].strip())
-            except:
-                return 0
+            match = re.search(r"\d+", line)
+            if match:
+                return int(match.group())
     return 0
 
 
@@ -105,18 +106,25 @@ async def add_water_reactions(msg):
 
 # ---------- ENSURE DAILY MESSAGE ----------
 async def ensure_daily_message():
+
     today = datetime.now().strftime("%B %d")
     channel = client.get_channel(CHANNEL_ID)
 
-    if data["date"] == today and data["message_id"]:
-        try:
-            await channel.fetch_message(data["message_id"])
-            return
-        except:
-            pass
+    async for msg in channel.history(limit=100):
 
-    async for msg in channel.history(limit=50):
-        if msg.author == client.user and f"Date: {today}" in msg.content:
+        if msg.author != client.user:
+            continue
+
+        if "Date:" not in msg.content:
+            continue
+
+        # Check if message is within 24 hours
+        age = (datetime.now(msg.created_at.tzinfo) - msg.created_at).total_seconds()
+
+        if age > 86400:
+            continue
+
+        if today in msg.content:
 
             data["date"] = today
             data["message_id"] = msg.id
@@ -126,8 +134,14 @@ async def ensure_daily_message():
             await add_water_reactions(msg)
             return
 
+    # If no valid message found, create new one
     data["date"] = today
-    data["meals"] = {"breakfast": [], "lunch": [], "dinner": [], "snacks": []}
+    data["meals"] = {
+        "breakfast": [],
+        "lunch": [],
+        "dinner": [],
+        "snacks": []
+    }
     data["water"] = 0
 
     msg = await channel.send(format_message())
@@ -152,35 +166,97 @@ async def add_meal(meal_type, food):
 
 
 # -------- MEAL COMMANDS --------
-@tree.command(name="breakfast")
+@tree.command(name="breakfast", description="Add breakfast entry")
 async def breakfast(interaction: discord.Interaction, food: str):
     await interaction.response.defer(ephemeral=True)
     await add_meal("breakfast", food)
     await interaction.followup.send("Breakfast added!", ephemeral=True)
 
 
-@tree.command(name="lunch")
+@tree.command(name="lunch", description="Add lunch entry")
 async def lunch(interaction: discord.Interaction, food: str):
     await interaction.response.defer(ephemeral=True)
     await add_meal("lunch", food)
     await interaction.followup.send("Lunch added!", ephemeral=True)
 
 
-@tree.command(name="dinner")
+@tree.command(name="dinner", description="Add dinner entry")
 async def dinner(interaction: discord.Interaction, food: str):
     await interaction.response.defer(ephemeral=True)
     await add_meal("dinner", food)
     await interaction.followup.send("Dinner added!", ephemeral=True)
 
 
-@tree.command(name="snack")
+@tree.command(name="snack", description="Add snack entry")
 async def snack(interaction: discord.Interaction, food: str):
     await interaction.response.defer(ephemeral=True)
     await add_meal("snacks", food)
     await interaction.followup.send("Snack added!", ephemeral=True)
 
+# -------- UPDATE COMMAND --------
+@tree.command(name="update", description="Sync or create today's tracker")
+async def update(interaction: discord.Interaction):
+
+    await interaction.response.defer(ephemeral=True)
+
+    await ensure_daily_message()
+
+    channel = client.get_channel(CHANNEL_ID)
+    msg = await channel.fetch_message(data["message_id"])
+
+    # re-parse message to sync memory
+    data["meals"] = parse_existing_message(msg.content)
+    data["water"] = parse_water_count(msg.content)
+
+    await add_water_reactions(msg)
+
+    await interaction.followup.send(
+        f"Tracker synced for **{data['date']}**",
+        ephemeral=True
+    )
+
+# ------- PHOTO COMMAND ---------
+@tree.command(name="addphoto", description="Upload a photo for a meal")
+@app_commands.choices(meal=[
+    app_commands.Choice(name="Breakfast", value="Breakfast"),
+    app_commands.Choice(name="Lunch", value="Lunch"),
+    app_commands.Choice(name="Dinner", value="Dinner"),
+    app_commands.Choice(name="Snack", value="Snack")
+])
+async def addphoto(
+    interaction: discord.Interaction,
+    meal: app_commands.Choice[str],
+    image: discord.Attachment
+):
+
+    await interaction.response.defer(ephemeral=True)
+
+    # make sure tracker exists
+    await ensure_daily_message()
+
+    channel = client.get_channel(CHANNEL_ID)
+    msg = await channel.fetch_message(data["message_id"])
+
+    # convert uploaded image to discord file
+    file = await image.to_file()
+
+    # post photo as reply to tracker
+    await msg.reply(
+        content=f"**{meal.value}**",
+        file=file
+    )
+
+    await interaction.followup.send("Meal photo added 📷", ephemeral=True)
 
 # -------- REMOVE SYSTEM --------
+@tree.command(name="remove", description="Remove meal entry")
+async def remove(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Choose category",
+        view=MealSelectView(),
+        ephemeral=True
+    )
+
 class MealSelect(discord.ui.Select):
 
     def __init__(self):
@@ -250,13 +326,7 @@ class ItemSelectView(discord.ui.View):
         self.add_item(ItemSelect(meal_type))
 
 
-@tree.command(name="remove")
-async def remove(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "Choose category",
-        view=MealSelectView(),
-        ephemeral=True
-    )
+
 
 
 # -------- WATER REACTIONS --------
