@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 import re
+import json
 
 
 load_dotenv()
@@ -22,7 +23,14 @@ tree = app_commands.CommandTree(client)
 data = {
     "date": "",
     "message_id": None,
+    "photo_message_id": None,
     "meals": {
+        "breakfast": [],
+        "lunch": [],
+        "dinner": [],
+        "snacks": []
+    },
+    "photos": {              
         "breakfast": [],
         "lunch": [],
         "dinner": [],
@@ -31,30 +39,74 @@ data = {
     "water": 0
 }
 
+# ------------ SAVE STATE ------------
+SAVE_FILE = "tracker_state.json"
+
+def save_state():
+    with open(SAVE_FILE, "w") as f:
+        json.dump({
+            "date": data["date"],
+            "message_id": data["message_id"],
+            "photo_message_id": data["photo_message_id"]
+        }, f)
+
+def load_state():
+    if not os.path.exists(SAVE_FILE):
+        return
+
+    with open(SAVE_FILE, "r") as f:
+        saved = json.load(f)
+
+    data["date"] = saved.get("date", "")
+    data["message_id"] = saved.get("message_id")
+    data["photo_message_id"] = saved.get("photo_message_id")
+
 # ---------- FORMAT MESSAGE ----------
 def format_message():
     liters = data["water"] * GLASS_LITERS
 
     def section(name, items):
+
+        text = f"**{name}**\n"
+
         if not items:
-            return f"**{name}**\n-"
-        return f"**{name}**\n" + "\n".join(f"• {i}" for i in items)
+            text += "-\n"
+        else:
+            text += "\n".join(f"• {i}" for i in items) + "\n"
+
+
+        return text
 
     return f"""```Date: {data['date']}```
 
-{section("Breakfast", data["meals"]["breakfast"])}
+    {section("Breakfast", data["meals"]["breakfast"])}
 
-{section("Lunch", data["meals"]["lunch"])}
+    {section("Lunch", data["meals"]["lunch"])}
 
-{section("Dinner", data["meals"]["dinner"])}
+    {section("Dinner", data["meals"]["dinner"])}
 
-{section("Snacks", data["meals"]["snacks"])}
+    {section("Snacks", data["meals"]["snacks"])}
 
-**Water:** {data['water']} bottles 💧 ({liters:.2f} L)
-"""
+    **Water:** {data['water']} bottles 💧 ({liters:.2f} L)
+    """
+
+def format_photo_message():
+
+    lines = []
+
+    for meal, photos in data["photos"].items():
+        for url in photos:
+            lines.append(f"[{meal.capitalize()}]({url})")
+
+    if not lines:
+        return "No photos yet."
+
+    return "\n".join(lines)
+
 
 # ---------- PARSE EXISTING MESSAGE ----------
 def parse_existing_message(content):
+
     meals = {"breakfast": [], "lunch": [], "dinner": [], "snacks": []}
     current = None
 
@@ -64,29 +116,67 @@ def parse_existing_message(content):
         if line.startswith("**Breakfast**"):
             current = "breakfast"
             continue
+
         if line.startswith("**Lunch**"):
             current = "lunch"
             continue
+
         if line.startswith("**Dinner**"):
             current = "dinner"
             continue
+
         if line.startswith("**Snacks**"):
             current = "snacks"
             continue
 
+        # only process bullet lines
         if line.startswith("•") and current:
-            meals[current].append(line.replace("• ", ""))
+
+            item = line.replace("• ", "").strip()
+
+            # ignore links (photos)
+            if re.search(r"https?://", item):
+                continue
+
+            # ignore placeholder
+            if item == "-" or item == "":
+                continue
+
+            meals[current].append(item)
 
     return meals
 
+# --------- PARSE PHOTOS ----------
+def parse_photo_message(content):
+
+    photos = {
+        "breakfast": [],
+        "lunch": [],
+        "dinner": [],
+        "snacks": []
+    }
+
+    for line in content.split("\n"):
+
+        match = re.match(r'(https?://\S+)\s+"(\w+)"', line)
+
+        if match:
+            url = match.group(1)
+            meal = match.group(2).lower()
+
+            if meal in photos:
+                photos[meal].append(url)
+
+    return photos
 
 # ---------- PARSE WATER ----------
 def parse_water_count(content):
-    for line in content.split("\n"):
-        if line.startswith("**Water:**"):
-            match = re.search(r"\d+", line)
-            if match:
-                return int(match.group())
+
+    match = re.search(r"\*\*Water:\*\*\s*(\d+)", content)
+
+    if match:
+        return int(match.group(1))
+
     return 0
 
 
@@ -132,6 +222,7 @@ async def ensure_daily_message():
             data["water"] = parse_water_count(msg.content)
 
             await add_water_reactions(msg)
+            save_state()
             return
 
     # If no valid message found, create new one
@@ -147,6 +238,11 @@ async def ensure_daily_message():
     msg = await channel.send(format_message())
     data["message_id"] = msg.id
 
+    photo_msg = await channel.send(format_photo_message())
+    data["photo_message_id"] = photo_msg.id
+
+    save_state()
+
     await add_water_reactions(msg)
 
 
@@ -157,6 +253,24 @@ async def update_tracker():
 
     await msg.edit(content=format_message())
 
+async def update_photos():
+    channel = client.get_channel(CHANNEL_ID)
+
+    # If photo message doesn't exist yet, create it
+    if not data["photo_message_id"]:
+        msg = await channel.send(format_photo_message())
+        data["photo_message_id"] = msg.id
+        save_state()
+        return
+
+    try:
+        msg = await channel.fetch_message(data["photo_message_id"])
+        await msg.edit(content=format_photo_message())
+
+    except discord.NotFound:
+        msg = await channel.send(format_photo_message())
+        data["photo_message_id"] = msg.id
+        save_state()
 
 # ---------- ADD MEAL ----------
 async def add_meal(meal_type, food):
@@ -204,9 +318,21 @@ async def update(interaction: discord.Interaction):
     channel = client.get_channel(CHANNEL_ID)
     msg = await channel.fetch_message(data["message_id"])
 
-    # re-parse message to sync memory
-    data["meals"] = parse_existing_message(msg.content)
-    data["water"] = parse_water_count(msg.content)
+    # re-parse photo message to sync memory
+    if data["photo_message_id"]:
+
+        try:
+            photo_msg = await channel.fetch_message(data["photo_message_id"])
+            data["photos"] = parse_photo_message(photo_msg.content)
+
+        except discord.NotFound:
+            print("Photo message missing, recreating...")
+            await update_photos()
+
+    else:
+        # create photo message if missing
+        await update_photos()
+    
 
     await add_water_reactions(msg)
 
@@ -218,10 +344,10 @@ async def update(interaction: discord.Interaction):
 # ------- PHOTO COMMAND ---------
 @tree.command(name="addphoto", description="Upload a photo for a meal")
 @app_commands.choices(meal=[
-    app_commands.Choice(name="Breakfast", value="Breakfast"),
-    app_commands.Choice(name="Lunch", value="Lunch"),
-    app_commands.Choice(name="Dinner", value="Dinner"),
-    app_commands.Choice(name="Snack", value="Snack")
+    app_commands.Choice(name="Breakfast", value="breakfast"),
+    app_commands.Choice(name="Lunch", value="lunch"),
+    app_commands.Choice(name="Dinner", value="dinner"),
+    app_commands.Choice(name="Snack", value="snacks")
 ])
 async def addphoto(
     interaction: discord.Interaction,
@@ -231,49 +357,57 @@ async def addphoto(
 
     await interaction.response.defer(ephemeral=True)
 
-    # make sure tracker exists
+    # make sure today's tracker exists
     await ensure_daily_message()
 
-    channel = client.get_channel(CHANNEL_ID)
-    msg = await channel.fetch_message(data["message_id"])
+    # store the image URL
+    data["photos"][meal.value].append(image.url)
 
-    # convert uploaded image to discord file
-    file = await image.to_file()
+    # update the photo message
+    await update_photos()
 
-    # post photo as reply to tracker
-    await msg.reply(
-        content=f"**{meal.value}**",
-        file=file
+    await interaction.followup.send(
+        f"Photo added to **{meal.name}** 📷",
+        ephemeral=True
     )
 
-    await interaction.followup.send("Meal photo added 📷", ephemeral=True)
-
 # -------- REMOVE SYSTEM --------
-@tree.command(name="remove", description="Remove meal entry")
+@tree.command(name="remove", description="Remove meal entry or photo")
 async def remove(interaction: discord.Interaction):
-    await interaction.response.send_message(
+
+    await interaction.response.defer(ephemeral=True)
+
+    await ensure_daily_message()
+
+    await interaction.followup.send(
         "Choose category",
         view=MealSelectView(),
         ephemeral=True
     )
 
+
+# ---------- CATEGORY SELECT ----------
 class MealSelect(discord.ui.Select):
 
     def __init__(self):
+
         options = [
             discord.SelectOption(label="Breakfast", value="breakfast"),
             discord.SelectOption(label="Lunch", value="lunch"),
             discord.SelectOption(label="Dinner", value="dinner"),
             discord.SelectOption(label="Snacks", value="snacks")
         ]
-        super().__init__(placeholder="Select meal type", options=options)
+
+        super().__init__(placeholder="Select category", options=options)
 
     async def callback(self, interaction: discord.Interaction):
+
         meal_type = self.values[0]
 
-        if not data["meals"][meal_type]:
+        if not data["meals"][meal_type] and not data["photos"][meal_type]:
+
             await interaction.response.edit_message(
-                content="No items in that category",
+                content="Nothing to remove in this category.",
                 view=None
             )
             return
@@ -284,34 +418,68 @@ class MealSelect(discord.ui.Select):
         )
 
 
+# ---------- ITEM SELECT ----------
 class ItemSelect(discord.ui.Select):
 
     def __init__(self, meal_type):
+
         self.meal_type = meal_type
 
-        options = [
-            discord.SelectOption(
-                label=f"{i+1}. {item}",
-                value=str(i)
+        options = []
+
+        # meals
+        for i, meal in enumerate(data["meals"][meal_type]):
+            options.append(
+                discord.SelectOption(
+                    label=f"{i+1}. {meal}",
+                    value=f"meal_{i}"
+                )
             )
-            for i, item in enumerate(data["meals"][meal_type])
-        ]
+
+        # photos
+        for i, photo in enumerate(data["photos"][meal_type]):
+
+            filename = photo.split("/")[-1][:50]
+
+            options.append(
+                discord.SelectOption(
+                    label=f"📷 {filename}",
+                    value=f"photo_{i}"
+                )
+            )
 
         super().__init__(placeholder="Select item", options=options)
 
     async def callback(self, interaction: discord.Interaction):
 
-        index = int(self.values[0])
-        removed = data["meals"][self.meal_type].pop(index)
+        selected = self.values[0]
 
-        await update_tracker()
+        type_, index = selected.split("_")
+        index = int(index)
+
+        if type_ == "meal":
+
+            removed = data["meals"][self.meal_type].pop(index)
+
+            await update_tracker()
+
+            message = f"Removed meal **{removed}**"
+
+        else:
+
+            data["photos"][self.meal_type].pop(index)
+
+            await update_photos()
+
+            message = "Removed 📷 photo"
 
         await interaction.response.edit_message(
-            content=f"Removed **{removed}**",
+            content=message,
             view=None
         )
 
 
+# ---------- VIEWS ----------
 class MealSelectView(discord.ui.View):
 
     def __init__(self):
@@ -324,9 +492,6 @@ class ItemSelectView(discord.ui.View):
     def __init__(self, meal_type):
         super().__init__(timeout=60)
         self.add_item(ItemSelect(meal_type))
-
-
-
 
 
 # -------- WATER REACTIONS --------
@@ -362,6 +527,35 @@ async def on_raw_reaction_add(payload):
 # -------- BOT READY --------
 @client.event
 async def on_ready():
+    load_state()
+
+    channel = client.get_channel(CHANNEL_ID)
+
+    if data["message_id"]:
+        try:
+            msg = await channel.fetch_message(data["message_id"])
+
+            data["meals"] = parse_existing_message(msg.content)
+            data["water"] = parse_water_count(msg.content)
+
+            if data["photo_message_id"]:
+                try:
+                    photo_msg = await channel.fetch_message(data["photo_message_id"])
+                    data["photos"] = parse_photo_message(photo_msg.content)
+                except discord.NotFound:
+                    print("Photo message missing, recreating...")
+                    await update_photos()
+
+            await add_water_reactions(msg)
+
+        except discord.NotFound:
+            print("Tracker message missing, creating a new one...")
+            data["message_id"] = None
+            await ensure_daily_message()
+
+    else:
+        await ensure_daily_message()
+
     await tree.sync()
     print("Logged in as", client.user)
 
